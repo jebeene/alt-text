@@ -1,0 +1,21 @@
+[project]
+name = "alt-text"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "jebeene", email = "89660618+jebeene@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "openai>=1.107.3",
+    "pillow>=11.3.0",
+    "streamlit>=1.49.1",
+]
+
+[project.scripts]
+alt-text = "alt_text:main"
+
+[build-system]
+requires = ["uv_build>=0.8.13,<0.9.0"]
+build-backend = "uv_build"
