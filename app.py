@@ -1,8 +1,10 @@
-import io, csv, base64
+# async_alt_text_app.py
+import io, csv, base64, asyncio
 from typing import List, Tuple
 import streamlit as st
-from openai import OpenAI
+from openai import AsyncOpenAI
 from PIL import Image, UnidentifiedImageError
+
 try:
     import magic  # type: ignore
     HAVE_MAGIC = True
@@ -10,18 +12,8 @@ except Exception:
     HAVE_MAGIC = False
 
 MODEL = "gpt-5-mini"
-MAX_ALT_CHARS = 125
-
-SYSTEM_PROMPT = f"""
-You write HTML alt text per W3C/WAI.
-- Concise, <= {MAX_ALT_CHARS} chars
-- No "image of" / "picture of"
-- Include salient details; include visible on-image text briefly when clear
-- Include brand/product if clearly visible (once)
-- Return only the alt string
-"""
-
-USER_PROMPT = f"Write alt text for this image for an HTML alt attribute, under {MAX_ALT_CHARS} chars."
+DEFAULT_MAX_ALT_CHARS = 125
+CONCURRENCY = 5  # run 5 images at a time
 
 def sniff_mime(buf: bytes, filename: str | None) -> str:
     if HAVE_MAGIC:
@@ -30,7 +22,6 @@ def sniff_mime(buf: bytes, filename: str | None) -> str:
             return m.from_buffer(buf)
         except Exception:
             pass
-    # fallback by extension
     if filename and filename.lower().endswith((".png",)):
         return "image/png"
     if filename and filename.lower().endswith((".webp",)):
@@ -44,31 +35,69 @@ def to_data_url(buf: bytes, filename: str | None) -> str:
     b64 = base64.b64encode(buf).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
-def generate_alt(client: OpenAI, file) -> str:
-    # file is a Streamlit UploadedFile
-    raw = file.getvalue()
+def build_prompts(max_chars: int) -> tuple[str, str]:
+    system_prompt = (
+        "You write HTML alt text per W3C/WAI.\n"
+        f"- Concise, <= {max_chars} chars\n"
+        '- No "image of" / "picture of"\n'
+        "- Include salient details; include visible on-image text briefly when clear\n"
+        "- Include brand/product if clearly visible (once)\n"
+        "- Return only the alt string"
+    )
+    user_prompt = f"Write alt text for this image for an HTML alt attribute, under {max_chars} chars."
+    return system_prompt, user_prompt
 
-    # sanity check that it's an image
+def verify_image_or_placeholder(file) -> tuple[bytes, bool]:
+    raw = file.getvalue()
     try:
         Image.open(io.BytesIO(raw)).verify()
+        return raw, True
     except (UnidentifiedImageError, OSError):
-        return "(not an image)"
+        return raw, False
 
-    data_url = to_data_url(raw, file.name)
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": USER_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ]},
-        ],
-        temperature=0.2,
-    )
-    text = (resp.choices[0].message.content or "").strip()
-    return text[:MAX_ALT_CHARS].rstrip()
+async def generate_alt_async(client: AsyncOpenAI, file, max_chars: int, sem: asyncio.Semaphore) -> tuple[str, str, int]:
+    """
+    Returns (filename, alt_text, char_count). If not an image, alt_text is "(not an image)".
+    """
+    async with sem:
+        raw, ok = verify_image_or_placeholder(file)
+        if not ok:
+            return file.name, "(not an image)", len("(not an image)")
 
+        data_url = to_data_url(raw, file.name)
+        system_prompt, user_prompt = build_prompts(max_chars)
+
+        resp = await client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        text = text[:max_chars].rstrip()
+        return file.name, text, len(text)
+
+async def process_all(files, api_key: str, max_chars: int) -> List[Tuple[str, str, int]]:
+    client = AsyncOpenAI(api_key=api_key)
+    sem = asyncio.Semaphore(CONCURRENCY)
+    tasks = [generate_alt_async(client, f, max_chars, sem) for f in files]
+    results = []
+    # optional: simple progress indicator
+    for coro in asyncio.as_completed(tasks):
+        results.append(await coro)
+    # preserve original file order in UI
+    order = {f.name: i for i, f in enumerate(files)}
+    results.sort(key=lambda r: order.get(r[0], 0))
+    return results
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Alt Text Generator", page_icon="🖼️", layout="centered")
 st.title("🖼️ Alt Text Generator")
 
@@ -78,11 +107,12 @@ with st.sidebar:
     st.caption("Tip: create a key in the OpenAI dashboard and paste it here.")
     st.divider()
     st.header("Settings")
-    max_chars = st.slider("Max characters", 60, 200, MAX_ALT_CHARS, 5)
+    max_chars = st.slider("Max characters", 60, 200, DEFAULT_MAX_ALT_CHARS, 5)
+    st.caption(f"Concurrency: {CONCURRENCY}")
 
 if api_key:
-    client = OpenAI(api_key=api_key)
     st.session_state.setdefault("rows", [])  # [(name, alt, chars)]
+    st.session_state.setdefault("file_bytes", {})  # cache image bytes for display
 
     files = st.file_uploader(
         "Upload images",
@@ -91,20 +121,26 @@ if api_key:
     )
 
     if files:
+        # cache bytes to avoid re-reading after async pass
+        for f in files:
+            st.session_state["file_bytes"][f.name] = f.getvalue()
+
         if st.button("Generate alt text for all"):
-            rows: List[Tuple[str, str, int]] = []
-            for f in files:
-                alt = generate_alt(client, f)
-                # enforce slider cap
-                alt = alt[:max_chars].rstrip()
-                rows.append((f.name, alt, len(alt)))
-            st.session_state["rows"] = rows
+            with st.spinner("Generating alt text…"):
+                # Run the async batch with bounded concurrency
+                rows: List[Tuple[str, str, int]] = asyncio.run(process_all(files, api_key, max_chars))
+                st.session_state["rows"] = rows
 
     # Show results
     if st.session_state.get("rows"):
         st.subheader("Results")
+        # Recreate lightweight UploadedFile-like objects for display from cached bytes
         for name, alt, n in st.session_state["rows"]:
-            st.image([f for f in files if f.name == name][0], caption=name, width=220)
+            buf = st.session_state["file_bytes"].get(name)
+            if buf:
+                st.image(buf, caption=name, width=220)
+            else:
+                st.write(f"*(preview unavailable for {name})*")
             st.text_area(f"Alt for {name}", alt, height=60, key=f"alt_{name}")
             st.caption(f"{n} characters")
 
@@ -121,4 +157,4 @@ if api_key:
             mime="text/csv",
         )
 else:
-    st.warning("Enter your OpenAI API key in the sidebar to continue.")
+    st.info("Add your OpenAI API key in the sidebar to begin.")
